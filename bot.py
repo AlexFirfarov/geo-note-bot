@@ -20,13 +20,13 @@ COMMANDS_DESCRIPTION = """
 /help - Вывести список команд
 /add - Добавить новое место
 /list [size] - Просмотреть список сохраненных мест (по умолчанию 10 мест). Необязательный параметр size отвечает за размер списка
-/reset - Удалить все сохраненные места
+/reset_all - Удалить все сохраненные места
 /settings - Изменить пользовательские настройки
 /search - Поиск места по названию
+/delete - Удаление места по названию
 
 При отправке геопозиции будет выдан список мест в заданном радиусе (по умолчанию 500 метров)
 """
-
 
 bot = telebot.TeleBot(TOKEN)
 
@@ -48,15 +48,19 @@ class DB:
         return con
 
     @classmethod
-    def insert(cls, cur, table_name, fields_list, values_list):
+    def insert(cls, cur, table_name, fields_list, values_list, conflict_field=None):
         query = sql.SQL("INSERT INTO {table}({fields}) VALUES({values})").format(
             table=sql.Identifier(table_name),
             fields=sql.SQL(', ').join(map(sql.Identifier, fields_list)),
             values=sql.SQL(', ').join(sql.Placeholder() * len(values_list)))
+        if conflict_field:
+            query = sql.Composed(
+                [query, sql.SQL("ON CONFLICT ({field}) DO NOTHING").format(
+                    field=sql.Identifier(conflict_field))])
         cur.execute(query, tuple(values_list))
 
     @classmethod
-    def select(cls, cur, table_name, fields_list, cond_field_list=None, cond_value_list=None, limit=None):
+    def select(cls, cur, table_name, fields_list, cond_field_list=None, cond_value_list=None, order_field=None, limit=None):
         query = sql.SQL("SELECT {fields} FROM {table}").format(
             fields=sql.SQL(', ').join(map(sql.Identifier, fields_list)),
             table=sql.Identifier(table_name),
@@ -65,6 +69,10 @@ class DB:
         if cond_field_list and cond_value_list:
             query = DB.__add_conditions(query, cond_field_list)
             values += cond_value_list
+        if order_field:
+            query = sql.Composed(
+                [query, sql.SQL("ORDER BY {field}").format(
+                    field=sql.Identifier(order_field))])
         if limit:
             query = sql.Composed(
                 [query, sql.SQL("LIMIT {limit}").format(limit=sql.Placeholder())])
@@ -114,7 +122,8 @@ class Place:
         self.user_id = user_id
         self.title = title
         self.photo = None
-        self.geo = None
+        self.latitude = None
+        self.longitude = None
 
 
 def create_temporary_keyboard(*fields):
@@ -151,11 +160,15 @@ def add(message: Message):
 
 def add_name_step(message: Message):
     try:
+        if not message.text:
+            raise ValueError()
         user_id = message.from_user.id
         title = message.text
         place = Place(user_id, title)
         msg = bot.send_message(user_id, 'Прикрепите фото')
         bot.register_next_step_handler(msg, add_photo_step, place=place)
+    except ValueError:
+        bot.reply_to(message, 'Недопустимое название')
     except Exception:
         bot.reply_to(message, 'Что-то пошло не так :(')
 
@@ -165,8 +178,7 @@ def add_photo_step(message: Message, place: Place):
         if message.photo:
             photo_info = bot.get_file(
                 message.photo[len(message.photo)-1].file_id)
-            downloaded_photo = bot.download_file(photo_info.file_path)
-            place.photo = downloaded_photo
+            place.photo = bot.download_file(photo_info.file_path)
         msg = bot.send_message(message.from_user.id, 'Отправьте геопозицию')
         bot.register_next_step_handler(
             msg, add_geoposition_step, place=place)
@@ -177,7 +189,8 @@ def add_photo_step(message: Message, place: Place):
 def add_geoposition_step(message: Message, place: Place):
     try:
         if message.location:
-            place.geo = message.location
+            place.latitude = message.location.latitude
+            place.longitude = message.location.longitude
         keyboard = create_temporary_keyboard('Да', 'Нет')
         msg = bot.send_message(message.from_user.id,
                                'Сохранить место?', reply_markup=keyboard)
@@ -188,63 +201,67 @@ def add_geoposition_step(message: Message, place: Place):
 
 
 def add_save_in_database_step(message: Message, place: Place):
-    if message.text == 'Да':
-        try:
-            con = DB.connect()
-            cur = con.cursor()
-            cur.execute(
-                """INSERT INTO users(user_id) VALUES(%s) ON CONFLICT (user_id) DO NOTHING""", (
-                    place.user_id,))
-
-            fields_list = ['user_id', 'title',
-                           'photo', 'latitude', 'longitude']
-            values_list = [place.user_id, place.title,
-                           place.photo, place.geo.latitude, place.geo.longitude]
-            DB.insert(cur, table_name='places',
-                      fields_list=fields_list, values_list=values_list)
-            con.commit()
-            bot.send_message(message.from_user.id, 'Место сохранено',
+    try:
+        if message.text != 'Да':
+            bot.send_message(message.from_user.id, 'Место не было сохранено',
                              reply_markup=ReplyKeyboardRemove())
-        except psycopg2.Error:
-            if con:
-                con.rollback()
-            bot.reply_to(message, 'Ошибка при сохранении',
+            return
+
+        con = DB.connect()
+        cur = con.cursor()
+        DB.insert(cur, table_name='users', fields_list=['user_id'], values_list=[
+            place.user_id], conflict_field='user_id')
+
+        fields_list = ['user_id', 'title',
+                       'photo', 'latitude', 'longitude']
+        values_list = [place.user_id, place.title,
+                       place.photo, place.latitude, place.longitude]
+        DB.insert(cur, table_name='places',
+                  fields_list=fields_list, values_list=values_list)
+        con.commit()
+        bot.send_message(message.from_user.id, 'Место сохранено',
                          reply_markup=ReplyKeyboardRemove())
-        except Exception:
-            bot.reply_to(message, 'Что-то пошло не так :(',
-                         reply_markup=ReplyKeyboardRemove())
-        finally:
-            if con:
-                con.close()
+    except psycopg2.Error:
+        if con:
+            con.rollback()
+        bot.reply_to(message, 'Ошибка при сохранении',
+                     reply_markup=ReplyKeyboardRemove())
+    except Exception:
+        bot.reply_to(message, 'Что-то пошло не так :(',
+                     reply_markup=ReplyKeyboardRemove())
+    finally:
+        if con:
+            con.close()
 
 
 @bot.message_handler(commands=['list'])
-def list(message: Message):
+def list_command(message: Message):
     try:
         con = DB.connect()
         cur = con.cursor()
 
         list_size = DEFAULT_LIST_OF_PLACES_SIZE
-        DB.select(cur, table_name='users', fields_list=['list_size'], cond_field_list=[
-                  'user_id'], cond_value_list=[message.from_user.id])
-        data = cur.fetchone()
-        if data:
-            list_size = data[0]
-        else:
-            bot.send_message(message.from_user.id,
-                             'У вас еще нет сохраненных мест')
-            return
-
         command = message.text.split(' ', maxsplit=1)
         if len(command) == 2:
             if int(command[1]) > 0:
                 list_size = int(command[1])
             else:
                 raise ValueError()
+        else:
+            DB.select(cur, table_name='users', fields_list=['list_size'], cond_field_list=[
+                'user_id'], cond_value_list=[message.from_user.id])
+            data = cur.fetchone()
+            if data:
+                list_size = data[0]
+            else:
+                bot.send_message(message.from_user.id,
+                                 'У вас еще нет сохраненных мест')
+                return
 
         fields_list = ['title', 'photo', 'latitude', 'longitude']
         DB.select(cur, table_name='places', fields_list=fields_list,
-                  cond_field_list=['user_id'], cond_value_list=[message.from_user.id], limit=list_size)
+                  cond_field_list=['user_id'], cond_value_list=[message.from_user.id],
+                  order_field='id', limit=list_size)
         place_list = cur.fetchall()
         if len(place_list) == 0:
             bot.send_message(message.from_user.id,
@@ -269,8 +286,8 @@ def list(message: Message):
             con.close()
 
 
-@bot.message_handler(commands=['reset'])
-def reset(message: Message):
+@bot.message_handler(commands=['reset_all'])
+def reset_all(message: Message):
     try:
         keyboard = create_temporary_keyboard('Да', 'Нет')
         msg = bot.send_message(message.from_user.id,
@@ -281,33 +298,37 @@ def reset(message: Message):
 
 
 def reset_delete_from_database_step(message: Message):
-    if message.text == 'Да':
-        try:
-            con = DB.connect()
-            cur = con.cursor()
-            DB.select(cur, table_name='places', fields_list=['title'], cond_field_list=[
-                      'user_id'], cond_value_list=[message.from_user.id])
-            cnt = cur.fetchone()
-            if not cnt:
-                bot.send_message(
-                    message.from_user.id, 'У вас еще нет сохраненных мест', reply_markup=ReplyKeyboardRemove())
-                return
-            DB.delete(cur, table_name='users', cond_field_list=[
-                      'user_id'], cond_value_list=[message.from_user.id])
-            con.commit()
+    try:
+        if message.text != 'Да':
             bot.send_message(
-                message.from_user.id, 'Все сохраненные места удалены', reply_markup=ReplyKeyboardRemove())
-        except psycopg2.Error:
-            bot.reply_to(message, 'Ошибка при удалении',
-                         reply_markup=ReplyKeyboardRemove())
-            if con:
-                con.rollback()
-        except Exception:
-            bot.reply_to(message, 'Что-то пошло не так :(',
-                         reply_markup=ReplyKeyboardRemove())
-        finally:
-            if con:
-                con.close()
+                message.from_user.id, 'Удаление отменено', reply_markup=ReplyKeyboardRemove())
+            return
+
+        con = DB.connect()
+        cur = con.cursor()
+        DB.select(cur, table_name='places', fields_list=['title'], cond_field_list=[
+                  'user_id'], cond_value_list=[message.from_user.id])
+        cnt = cur.fetchone()
+        if not cnt:
+            bot.send_message(
+                message.from_user.id, 'У вас еще нет сохраненных мест', reply_markup=ReplyKeyboardRemove())
+            return
+        DB.delete(cur, table_name='users', cond_field_list=[
+                  'user_id'], cond_value_list=[message.from_user.id])
+        con.commit()
+        bot.send_message(
+            message.from_user.id, 'Все сохраненные места удалены', reply_markup=ReplyKeyboardRemove())
+    except psycopg2.Error:
+        bot.reply_to(message, 'Ошибка при удалении',
+                     reply_markup=ReplyKeyboardRemove())
+        if con:
+            con.rollback()
+    except Exception:
+        bot.reply_to(message, 'Что-то пошло не так :(',
+                     reply_markup=ReplyKeyboardRemove())
+    finally:
+        if con:
+            con.close()
 
 
 @bot.message_handler(content_types=['location'])
@@ -345,7 +366,7 @@ def get_places_within_radius(message: Message):
                     bot.send_location(
                         message.from_user.id, latitude=latitude, longitude=longitude)
                     bot.send_message(message.from_user.id,
-                                     f'Расстояние: {distance_meters} метров')
+                                     f'Расстояние: {distance_meters:.2f} метров')
     except psycopg2.Error:
         bot.reply_to(message, 'Ошибка при получении списка сохраненных мест')
     except Exception:
@@ -369,7 +390,7 @@ def get_distance_meters(lat1d, lon1d, lat2d, lon2d):
 
 
 @bot.message_handler(commands=['settings'])
-def change_settings_welcome(message: Message):
+def change_settings(message: Message):
     try:
         keyboard = create_temporary_keyboard(
             'Размер списка при вызове команды list', 'Радиус поиска ближайших мест')
@@ -382,10 +403,15 @@ def change_settings_welcome(message: Message):
 
 def change_settings_new_value_input(message: Message):
     try:
+        if message.text not in ['Размер списка при вызове команды list', 'Радиус поиска ближайших мест']:
+            raise ValueError()
         msg = bot.send_message(
             message.from_user.id, 'Введите новое значение', reply_markup=ReplyKeyboardRemove())
         bot.register_next_step_handler(
             msg, change_settings_update, setting=message.text)
+    except ValueError:
+        bot.reply_to(message, 'Неверная настройка',
+                     reply_markup=ReplyKeyboardRemove())
     except Exception:
         bot.reply_to(message, 'Что-то пошло не так :(',
                      reply_markup=ReplyKeyboardRemove())
@@ -395,8 +421,8 @@ def change_settings_update(message: Message, setting):
     try:
         con = DB.connect()
         cur = con.cursor()
-        cur.execute(
-            """INSERT INTO users(user_id) VALUES(%s) ON CONFLICT (user_id) DO NOTHING""", (message.from_user.id,))
+        DB.insert(cur, table_name='users', fields_list=['user_id'], values_list=[
+            message.from_user.id], conflict_field='user_id')
         value = message.text
         field_name = None
         if setting == 'Размер списка при вызове команды list':
@@ -424,8 +450,8 @@ def change_settings_update(message: Message, setting):
             con.close()
 
 
-@ bot.message_handler(commands=['search'])
-def search_welcome(message: Message):
+@ bot.message_handler(commands=['search', 'delete'])
+def search_or_delete(message: Message):
     try:
         con = DB.connect()
         cur = con.cursor()
@@ -439,7 +465,11 @@ def search_welcome(message: Message):
         keyboard = create_temporary_keyboard(*title_list)
         msg = bot.send_message(message.from_user.id,
                                'Выберите место', reply_markup=keyboard)
-        bot.register_next_step_handler(msg, search_in_data_base)
+        if message.text == '/search':
+            bot.register_next_step_handler(msg, search_in_data_base)
+        elif message.text == '/delete':
+            bot.register_next_step_handler(
+                msg, delete_from_data_base, title_list=title_list)
     except Exception:
         bot.reply_to(message, 'Что-то пошло не так :(',
                      reply_markup=ReplyKeyboardRemove())
@@ -456,6 +486,10 @@ def search_in_data_base(message: Message):
         DB.select(cur, table_name='places', fields_list=['photo', 'latitude', 'longitude'], cond_field_list=[
                   'user_id', 'title'], cond_value_list=[message.from_user.id, title])
         found_places = cur.fetchall()
+        if len(found_places) == 0:
+            bot.send_message(message.from_user.id, 'Место не найдено',
+                             reply_markup=ReplyKeyboardRemove())
+            return
         for photo, latitude, longitude in found_places:
             bot.send_message(message.from_user.id, title,
                              reply_markup=ReplyKeyboardRemove())
@@ -464,6 +498,33 @@ def search_in_data_base(message: Message):
             if latitude and longitude:
                 bot.send_location(message.from_user.id,
                                   latitude=latitude, longitude=longitude)
+    except Exception:
+        bot.reply_to(message, 'Что-то пошло не так :(',
+                     reply_markup=ReplyKeyboardRemove())
+    finally:
+        if con:
+            con.close()
+
+
+def delete_from_data_base(message: Message, title_list):
+    try:
+        title = message.text
+        if title not in title_list:
+            bot.send_message(message.from_user.id, 'Место не найдено',
+                             reply_markup=ReplyKeyboardRemove())
+            return
+        con = DB.connect()
+        cur = con.cursor()
+        DB.delete(cur, table_name='places', cond_field_list=[
+                  'user_id', 'title'], cond_value_list=[message.from_user.id, title])
+        con.commit()
+        bot.send_message(message.from_user.id, 'Место удалено',
+                         reply_markup=ReplyKeyboardRemove())
+    except psycopg2.Error:
+        bot.reply_to(message, 'Ошибка при удалении',
+                     reply_markup=ReplyKeyboardRemove())
+        if con:
+            con.rollback()
     except Exception:
         bot.reply_to(message, 'Что-то пошло не так :(',
                      reply_markup=ReplyKeyboardRemove())
