@@ -6,9 +6,11 @@ from telebot.types import Message, ReplyKeyboardMarkup, ReplyKeyboardRemove, Key
 
 from bot_settings import *
 
+import os
+from flask import Flask, request
 
 WELCOME_MESSAGE = """
-Привет. Я бот для гео заметок. Я помогу тебе сохранить и запомнить самые важные и интересные места.
+Привет. Я бот гео заметок. Я помогу тебе сохранить и запомнить самые важные и интересные места.
 Просмотреть список команд можно вызвав команду /help
 """
 
@@ -18,20 +20,21 @@ COMMANDS_DESCRIPTION = """
 Список команд:
 
 /start - Вывести приветственное сообщение
-/help - Вывести список команд
+/help - Вывести список доступных команд
 /add - Добавить новое место
-/list [size] - Просмотреть список сохраненных мест (по умолчанию 10 мест). Необязательный параметр size отвечает за размер списка
+/list [size] - Просмотреть список из последних сохраненных мест (по умолчанию 10 мест). Необязательный параметр size отвечает за размер списка
 /reset_all - Удалить все данные пользователя
 /settings - Изменить пользовательские настройки
 /search - Поиск места по названию
 /delete - Удаление места по названию
-/add_friend - Добавить контакт друга. 
+/add_friend - Добавить контакт друга
 /delete_friend - Удалить друга
 
-При отправке геопозиции будет выдан список мест в заданном радиусе (по умолчанию 500 метров)
+При отправке координат будет выдан список мест в заданном радиусе (по умолчанию 500 метров)
 """
 
 bot = telebot.TeleBot(TOKEN)
+server = Flask(__name__)
 
 
 class DB:
@@ -229,7 +232,6 @@ def add_save_in_database_step(message: Message, place: Place):
         cur = con.cursor()
         DB.insert(cur, table_name='users', fields_list=['user_id', 'user_name'], values_list=[
                   place.user_id, place.user_name], conflict_field_list=['user_id'])
-
         fields_list = ['user_id', 'title',
                        'photo', 'latitude', 'longitude']
         values_list = [place.user_id, place.title,
@@ -252,7 +254,7 @@ def add_save_in_database_step(message: Message, place: Place):
             con.close()
 
 
-@bot.message_handler(commands=['list'])  # friends?
+@bot.message_handler(commands=['list'])
 def list_command(message: Message):
     con = None
     cur = None
@@ -300,8 +302,8 @@ def list_command(message: Message):
         bot.reply_to(message, 'Длина списка должна быть целым числом больше 0')
     except psycopg2.Error:
         bot.reply_to(message, 'Ошибка при получении списка сохраненных мест')
-    except Exception as err:
-        bot.reply_to(message, ERROR_MESSAGE + str(err))
+    except Exception:
+        bot.reply_to(message, ERROR_MESSAGE)
     finally:
         if con:
             con.close()
@@ -310,9 +312,9 @@ def list_command(message: Message):
 @bot.message_handler(commands=['reset_all'])
 def reset_all(message: Message):
     try:
-        keyboard = create_temporary_reply_keyboard('Да', 'Нет')
+        keyboard = create_temporary_reply_keyboard('Отмена')
         msg = bot.send_message(message.from_user.id,
-                               'Удалить все данные пользователя?', reply_markup=keyboard)
+                               'Для удаления всех данных пользователя введите слово "Удалить".', reply_markup=keyboard)
         bot.register_next_step_handler(msg, reset_delete_from_database_step)
     except Exception:
         bot.reply_to(message, ERROR_MESSAGE,
@@ -324,11 +326,11 @@ def reset_delete_from_database_step(message: Message):
     cur = None
 
     try:
-        if message.text != 'Да':
+        if message.text != 'Удалить':
             bot.send_message(
                 message.from_user.id, 'Удаление отменено', reply_markup=ReplyKeyboardRemove())
             return
-
+        
         con = DB.connect()
         cur = con.cursor()
         DB.delete(cur, table_name='users', cond_field_list=[
@@ -403,7 +405,7 @@ def get_places_within_radius(message: Message):
 
 
 def get_distance_meters(lat1d, long1d, lat2d, long2d):
-    earth_radius_m = 6372795
+    earth_radius_m = 6371009
 
     lat1 = math.radians(lat1d)
     long1 = math.radians(long1d)
@@ -528,7 +530,8 @@ def search(message: Message):
             bot.send_message(message.from_user.id,
                              'Сохраненных мест не найдено')
             return
-        elif visible == True:
+        visible = visible[0]
+        if visible == True:
             cur.execute("SELECT title, id FROM places WHERE user_id IN (SELECT user_id FROM friends WHERE friend_id = %s) OR user_id = %s",
                         (message.from_user.id, message.from_user.id))
         else:
@@ -796,8 +799,21 @@ def delete_friend_from_database(message: Message, friends_list, friends_name):
         if con:
             con.close()
 
+@server.route('/' + TOKEN, methods=['POST'])
+def getMessage():
+    json_string = request.get_data().decode('utf-8')
+    update = telebot.types.Update.de_json(json_string)
+    bot.process_new_updates([update])
+    return "!", 200
+
+@server.route("/")
+def webhook():
+    bot.remove_webhook()
+    bot.set_webhook(url='https://geo-note-bot.herokuapp.com/' + TOKEN)
+    return "!", 200
 
 bot.enable_save_next_step_handlers(delay=1)
 bot.load_next_step_handlers()
 
-bot.polling(none_stop=True)
+if __name__ == "__main__":
+    server.run(host="0.0.0.0", port=int(os.environ.get('PORT', 5000)))
